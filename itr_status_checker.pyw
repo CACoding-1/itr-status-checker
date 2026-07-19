@@ -29,7 +29,6 @@ RUN:
 
 import os
 import time
-import random
 import threading
 import queue
 import re
@@ -118,7 +117,9 @@ class IncomeTaxPortal:
             self.driver.execute_script("arguments[0].click();", el)
         return el
 
-    def type(self, locators, text, timeout=None, slow=False):
+    def type(self, locators, text, timeout=None):
+        """Type into a field fast, then verify it landed; if not, force the
+        value via JS + input/change events so Angular registers it."""
         el = self.find(locators, timeout=timeout)
         try:
             self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
@@ -130,12 +131,7 @@ class IncomeTaxPortal:
             pass
         try:
             el.clear()
-            if slow:
-                for ch in str(text):
-                    el.send_keys(ch)
-                    time.sleep(random.uniform(0.06, 0.19))
-            else:
-                el.send_keys(text)
+            el.send_keys(text)
         except Exception:
             pass
         if (el.get_attribute("value") or "").strip() != str(text).strip():
@@ -184,6 +180,57 @@ class IncomeTaxPortal:
                 pass
             time.sleep(0.3)
         raise TimeoutException(f"No clickable element with text '{text}'")
+
+    def click_css(self, css, timeout=15):
+        """Click the first visible element matching a CSS selector (fast path
+        for elements with a stable id/class). JS click, so overlays don't block."""
+        js = r"""
+        const el = document.querySelector(arguments[0]);
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        el.scrollIntoView({block:'center'});
+        el.click();
+        return true;
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                if self.driver.execute_script(js, css):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.2)
+        raise TimeoutException(f"No clickable element for CSS '{css}'")
+
+    def click_menu_item(self, text, timeout=12):
+        """Click a Material menu item (role=menuitem / .mat-mdc-menu-item) by
+        its visible text — used for the e-File submenu and the Log Out item."""
+        js = r"""
+        const want = arguments[0].trim().toLowerCase();
+        const items = document.querySelectorAll(
+            '[role=menuitem], .mat-mdc-menu-item, button[mat-menu-item]');
+        for (const el of items){
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+          if (t === want || t.includes(want)){
+            el.scrollIntoView({block:'center'});
+            el.click();
+            return true;
+          }
+        }
+        return false;
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                if self.driver.execute_script(js, text):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.2)
+        raise TimeoutException(f"No menu item '{text}'")
 
     def check_box(self, timeout=8):
         def is_ticked():
@@ -246,40 +293,6 @@ class IncomeTaxPortal:
             time.sleep(0.3)
         return False
 
-    def select_option(self, option_text, timeout=10):
-        """Pick a value from whichever native <select> contains a matching
-        option. Returns chosen text or None."""
-        from selenium.webdriver.support.ui import Select
-        want = str(option_text).strip().lower()
-        end = time.time() + timeout
-        while time.time() < end:
-            for sel in self.driver.find_elements(By.TAG_NAME, "select"):
-                try:
-                    if not sel.is_displayed() or not sel.is_enabled():
-                        continue
-                    s = Select(sel)
-                    idx = next((i for i, o in enumerate(s.options)
-                                if want in (o.text or "").strip().lower()), None)
-                    if idx is None:
-                        continue
-                    chosen = s.options[idx].text
-                    try:
-                        s.select_by_index(idx)
-                    except Exception:
-                        pass
-                    self.driver.execute_script(
-                        "arguments[0].selectedIndex = arguments[1];"
-                        "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", sel, idx)
-                    try:
-                        if want in (Select(sel).first_selected_option.text or "").strip().lower():
-                            return chosen
-                    except Exception:
-                        return chosen
-                except Exception:
-                    continue
-            time.sleep(0.3)
-        return None
-
     def present(self, xpath):
         for el in self.driver.find_elements(By.XPATH, xpath):
             try:
@@ -295,7 +308,7 @@ class IncomeTaxPortal:
         except Exception:
             return ""
 
-    def wait_loaded(self, timeout=30, settle=0.6):
+    def wait_loaded(self, timeout=30, settle=0.25):
         """Block until the page has finished loading: document ready AND no
         visible loading spinner/overlay, held stable for `settle` seconds.
         Always returns within `timeout`, so a stuck spinner can never hang the
@@ -332,11 +345,25 @@ class IncomeTaxPortal:
                     idle_since = time.time()
                 elif time.time() - idle_since >= settle:
                     return True
-            time.sleep(0.25)
+            time.sleep(0.1)
         return False
 
     # ---- THE LOGIN ------------------------------------------------------- #
-    def login(self, pan, password, attempts=3, on_otp=None):
+    PAN_XPATH = ("//input[@id='panAdharUserId' or @formcontrolname='userId'"
+                 " or contains(@placeholder,'PAN') or contains(@placeholder,'User ID')]")
+
+    def _on_login_page(self, timeout=5):
+        """True once the PAN/User-ID field is on screen (we're on the login
+        page). After a previous row's 'Log In Again', this is already true, so
+        we can skip re-navigating and just type the next PAN."""
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.present(self.PAN_XPATH):
+                return True
+            time.sleep(0.3)
+        return False
+
+    def login(self, pan, password, attempts=3):
         d = self.driver
         pan = str(pan).strip().upper()
         self.log(f"Logging in — PAN {pan}")
@@ -353,17 +380,30 @@ class IncomeTaxPortal:
             (By.XPATH, "//input[@formcontrolname='password']"),
         ]
 
-        d.get(self.LOGIN_URL)
+        # Only load the login page if we aren't already on it (the previous
+        # row's 'Log In Again' click leaves us here — no reload needed). Gate the
+        # wait on the URL so a fresh browser doesn't idle before the first load.
+        on_login = False
         try:
-            self.type(pan_locators, pan, timeout=12)
+            if "incometax" in (d.current_url or "").lower():
+                on_login = self._on_login_page(timeout=4)
         except Exception:
-            self.log("  (direct login page didn't load — homepage fallback)")
-            d.get(self.PORTAL_URL)
+            on_login = False
+
+        if not on_login:
+            d.get(self.LOGIN_URL)
             try:
-                self.click_text("Login", timeout=15)
+                self.type(pan_locators, pan, timeout=12)
             except Exception:
-                pass
-            self.type(pan_locators, pan, timeout=15)
+                self.log("  (direct login page didn't load — homepage fallback)")
+                d.get(self.PORTAL_URL)
+                try:
+                    self.click_text("Login", timeout=15)
+                except Exception:
+                    pass
+                self.type(pan_locators, pan, timeout=15)
+        else:
+            self.type(pan_locators, pan, timeout=12)
 
         self.click([(By.XPATH, "//button[normalize-space()='Continue']"),
                     (By.ID, "continueBtn")])
@@ -373,22 +413,19 @@ class IncomeTaxPortal:
         else:
             self.log("  WARNING: could not tick secure-access checkbox")
 
-        self.type(pw_locators, password, slow=True)
+        self.type(pw_locators, password)
         status = self._submit(password, pw_locators, attempts)
         if status == "invalid":
             raise InvalidPasswordError(f"Invalid password for PAN {pan}")
         if status == "failed":
             raise LoginError(f"Login did not proceed for PAN {pan}")
 
-        time.sleep(1.5)
+        time.sleep(0.8)
         page = d.page_source.lower()
         if "otp" in page or "captcha" in page:
             self.log("  OTP/CAPTCHA detected — solve it in the browser window")
-            if on_otp:
-                on_otp(d)
-            else:
-                # No console here (.pyw). Wait for the OTP screen to clear.
-                self._wait_otp_cleared(timeout=180)
+            # No console here (.pyw). Wait for the OTP screen to clear.
+            self._wait_otp_cleared(timeout=180)
 
         self.wait_loaded(timeout=30)
         self.log("  login complete")
@@ -420,24 +457,24 @@ class IncomeTaxPortal:
             if attempt > 1:
                 self.log(f"  re-entering password (attempt {attempt}/{attempts})")
                 self._erase_password(pw_locators)
-                self.type(pw_locators, password, slow=True, timeout=8)
+                self.type(pw_locators, password, timeout=8)
             try:
                 self.click(continue_locs, timeout=8)
             except Exception:
                 self.log(f"  WARNING: Continue not clickable (attempt {attempt})")
 
-            end = time.time() + 8
+            end = time.time() + 6
             while time.time() < end:
                 self._dismiss_login_here()
+                if not self.present("//input[@type='password']"):
+                    return "ok"                                  # progressed — fastest exit
                 low = self.visible_text().lower()
                 if any(k in low for k in INVALID):
                     return "invalid"
-                if not self.present("//input[@type='password']"):
-                    return "ok"
                 if any(k in low for k in REAUTH):
                     self.log("  'Request not authenticated' — will erase & retry")
                     break
-                time.sleep(0.4)
+                time.sleep(0.2)
         return "ok" if not self.present("//input[@type='password']") else "failed"
 
     def _erase_password(self, pw_locators):
@@ -459,8 +496,20 @@ class IncomeTaxPortal:
                 pass
 
     def _dismiss_login_here(self):
+        """One-shot, non-blocking: click a 'Login here' dialog if present, else
+        return immediately (never polls — so it doesn't slow the submit loop)."""
+        js = r"""
+        for (const el of document.querySelectorAll('button,a,span,div')){
+          const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+          if (t === 'login here'){
+            const r = el.getBoundingClientRect();
+            if (r.width && r.height){ el.click(); return true; }
+          }
+        }
+        return false;
+        """
         try:
-            return self.click_text("Login here", timeout=1)
+            return bool(self.driver.execute_script(js))
         except Exception:
             return False
 
@@ -507,152 +556,96 @@ def go_to_filed_returns(portal):
     """e-File -> Income Tax Returns -> View Filed Returns."""
     portal.log("  navigating: e-File > Income Tax Returns > View Filed Returns")
     portal.wait_loaded(timeout=30)
-    portal.click_text("e-File", timeout=20)
-    time.sleep(0.8)                       # let the menu expand
-    portal.click_text("Income Tax Returns", timeout=20)
-    time.sleep(0.8)
-    portal.click_text("View Filed Returns", timeout=20)
+    portal.click_css("#e-File", timeout=20)               # e-File menu (stable id)
+    portal.click_menu_item("Income Tax Returns", timeout=15)   # submenu trigger
+    portal.click_text("View Filed Returns", timeout=15)        # (unchanged)
     portal.wait_loaded(timeout=30)
     # Confirm the results page actually rendered.
-    end = time.time() + 25
+    end = time.time() + 20
     while time.time() < end:
         low = portal.visible_text().lower()
         if "filed returns" in low or "filing type" in low or "acknowledgement" in low:
             return True
-        time.sleep(0.5)
+        time.sleep(0.4)
     portal.log("  WARNING: 'View Filed Returns' page did not clearly load")
     return False
 
 
 def filter_by_ay(portal, ay):
-    """Filter the list: click Filter -> open the Assessment Year dropdown ->
-    pick the year -> click the panel's Filter button to apply."""
+    """Filter the list: click Filter (#filterbtn1) -> open the Assessment Year
+    mat-select -> pick the year -> click the panel's Filter apply (#okButton)."""
     ay = normalize_ay(ay)
     portal.log(f"  filtering by Assessment Year {ay}")
-    portal.wait_loaded(timeout=20)
 
-    # 1) Open the Filter panel.
+    # 1) Open the Filter panel (client-side toggle — no page load to wait for).
     try:
-        portal.click_text("Filter", timeout=10)
+        portal.click_css("#filterbtn1", timeout=10)
     except Exception:
         portal.log("  WARNING: could not find the Filter button")
-    time.sleep(0.8)
-    portal.wait_loaded(timeout=15)
 
     # 2) Open the Assessment Year dropdown and pick the year.
     if _choose_ay(portal, ay):
         portal.log(f"  Assessment Year set to {ay}")
     else:
         portal.log(f"  WARNING: could not set Assessment Year to {ay}")
-    time.sleep(0.5)
 
-    # 3) Apply — click the panel's blue 'Filter' button. Match it among real
-    #    buttons by EXACT text 'Filter' (so 'Filter By' is ignored) and take
-    #    the bottom-most one (the apply button sits below the toggle).
-    apply_js = r"""
-    let best = null;
-    const els = document.querySelectorAll(
-        'button,[role=button],input[type=button],input[type=submit],a');
-    for (const el of els){
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) continue;
-      const txt = (el.innerText || el.value || '').trim().toLowerCase();
-      if (txt !== 'filter') continue;                 // exact, not 'filter by'
-      if (!best || r.top > best.top){ best = {el: el, top: r.top}; }
-    }
-    if (!best) return false;
-    best.el.scrollIntoView({block:'center'});
-    best.el.click();
-    return true;
-    """
-    applied = False
-    end = time.time() + 8
-    while time.time() < end:
-        try:
-            if portal.driver.execute_script(apply_js):
-                applied = True
-                break
-        except Exception:
-            pass
-        time.sleep(0.4)
-    if not applied:
+    # 3) Apply (the panel's blue 'Filter' button has id 'okButton').
+    try:
+        portal.click_css("#okButton", timeout=8)
+    except Exception:
         portal.log("  WARNING: could not click the Filter (apply) button")
     portal.wait_loaded(timeout=30)
 
 
 def _choose_ay(portal, ay):
-    """Open the Assessment Year dropdown box and click the matching year.
-    Tries a native <select> first, then the click-to-open custom dropdown."""
+    """Open the Assessment Year mat-select (formcontrolname='ay') and click the
+    matching year option, then close the (multi-select) overlay so the apply
+    button is clickable."""
     d = portal.driver
 
-    # Simplest case: a real <select>.
-    if portal.select_option(ay, timeout=3):
-        return True
-
-    # Open the dropdown box that sits just below the 'Assessment Year' label.
     open_js = r"""
-    const lbl = arguments[0].trim().toLowerCase();
-    let label = null;
-    for (const el of document.querySelectorAll('label,span,div,p')){
-      if ((el.textContent||'').trim().toLowerCase() === lbl){ label = el; break; }
-    }
-    if (!label){
-      for (const el of document.querySelectorAll('label,span,div,p')){
-        if ((el.textContent||'').trim().toLowerCase().startsWith(lbl)){ label = el; break; }
-      }
-    }
-    if (!label) return false;
-    const lr = label.getBoundingClientRect();
-    const sel = 'select,.p-dropdown,[role=combobox],.mat-select,.ui-dropdown,'
-              + '.dropdown-toggle,.p-dropdown-trigger,div[class*=dropdown],'
-              + 'div[class*=select],input[readonly]';
-    let best = null;
-    for (const el of document.querySelectorAll(sel)){
-      const r = el.getBoundingClientRect();
-      if (r.width===0 || r.height===0) continue;
-      const dy = r.top - lr.top;
-      if (dy < -5 || dy > 120) continue;            // at / just below the label
-      const score = dy + Math.abs(r.left - lr.left) * 0.2;
-      if (!best || score < best.score){ best = {el: el, score: score}; }
-    }
-    if (!best) return false;
-    best.el.scrollIntoView({block:'center'});
-    best.el.click();
+    const host = document.querySelector('mat-select[formcontrolname=ay]');
+    if (!host) return false;
+    const trig = host.querySelector('.mat-mdc-select-trigger') || host;
+    trig.scrollIntoView({block:'center'});
+    trig.click();
     return true;
     """
-
-    # Click the year option. The open option sits BELOW the closed trigger,
-    # so among exact-text matches we pick the one with the largest 'top'.
     pick_js = r"""
     const want = arguments[0].trim().toLowerCase().replace(/\s+/g,'');
-    let cands = [];
-    for (const el of document.querySelectorAll(
-        'li,[role=option],.p-dropdown-item,.mat-option,option,span,div,a')){
-      if (el.children && el.children.length > 2) continue;     // leaf-ish only
+    for (const el of document.querySelectorAll('mat-option, .mat-mdc-option, [role=option]')){
       const r = el.getBoundingClientRect();
-      if (r.width===0 || r.height===0) continue;
-      const t = (el.textContent || el.value || '').trim().toLowerCase().replace(/\s+/g,'');
-      if (t === want){ cands.push({el: el, top: r.top}); }
+      if (r.width === 0 || r.height === 0) continue;
+      const t = (el.textContent || '').trim().toLowerCase().replace(/\s+/g,'');
+      if (t === want){ el.scrollIntoView({block:'center'}); el.click(); return true; }
     }
-    if (!cands.length) return false;
-    cands.sort((a,b) => b.top - a.top);
-    cands[0].el.scrollIntoView({block:'center'});
-    cands[0].el.click();
-    return true;
+    return false;
     """
+    close_js = "const b = document.querySelector('.cdk-overlay-backdrop'); if (b) b.click();"
 
     for _ in range(3):
         try:
-            d.execute_script(open_js, "Assessment Year")
+            d.execute_script(open_js)
         except Exception:
             pass
-        time.sleep(0.9)
-        try:
-            if d.execute_script(pick_js, ay):
-                return True
-        except Exception:
-            pass
-        time.sleep(0.5)
+        # Poll for the option to render and click it the instant it appears.
+        picked = False
+        end = time.time() + 2.5
+        while time.time() < end:
+            try:
+                if d.execute_script(pick_js, ay):
+                    picked = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        if picked:
+            try:
+                d.execute_script(close_js)      # close the overlay (multi-select stays open)
+            except Exception:
+                pass
+            time.sleep(0.2)
+            return True
     return False
 
 
@@ -663,10 +656,10 @@ EMPTY_HINTS = [
 ]
 
 
-def read_latest_status(portal, settle=8):
+def read_latest_status(portal, settle=6):
     """Return the LATEST status for the filtered AY, or 'ITR not filed' when no
-    return is shown. The latest status is the top-most label in the timeline."""
-    portal.wait_loaded(timeout=20)
+    return is shown. The latest status is the top-most label in the timeline.
+    (filter_by_ay already waited for the results to load, so we read at once.)"""
     # Report ONLY the status phrase (no dates / acknowledgement numbers): we
     # return the matched known status, not the element's raw text.
     scan_js = r"""
@@ -699,7 +692,7 @@ def read_latest_status(portal, settle=8):
         low = portal.visible_text().lower()
         if any(h in low for h in EMPTY_HINTS):
             return "ITR not filed"
-        time.sleep(0.5)
+        time.sleep(0.25)
 
     # Settled with no status text. A filing card always carries an
     # acknowledgement number, so its absence means nothing was filed.
@@ -708,87 +701,104 @@ def read_latest_status(portal, settle=8):
     return "ITR not filed"
 
 
-def logout(portal):
-    """Open the top-right profile menu and click 'Log Out' (matches the
-    'My Profile / Change Password / Log Out' dropdown)."""
-    portal.wait_loaded(timeout=15)
-    d = portal.driver
+def extract_fields(portal):
+    """After the AY filter is applied, pull extra fields from the filing card:
+    Acknowledgement No, Filing Date, and the Intimation Order date. Each field
+    that is absent comes back as 'Not found'.
 
-    # Click the menu item whose EXACT text is Log Out / Logout / Sign Out.
-    click_logout_js = r"""
-    const wants = ['log out', 'logout', 'sign out', 'log off'];
-    let best = null;
-    for (const el of document.querySelectorAll('a,button,li,span,div,p')){
-      if (el.children && el.children.length > 1) continue;        // leaf node only
-      const r = el.getBoundingClientRect();
-      if (r.width===0 || r.height===0) continue;
-      const t = (el.innerText || el.textContent || '').trim().toLowerCase();
-      if (wants.includes(t)){
-        if (!best || t.length < best.len){ best = {el: el, len: t.length}; }
+    Structure on the portal: every field is a pair of <mat-label> — one
+    class='rightsideLabel' (the caption, e.g. 'Acknowledgement No :') followed
+    by one class='fieldVal' (the value). The intimation is the exception: a
+    '.hyperLink' span reading 'Download Intimation Order Dated <date>'."""
+    js = r"""
+    const out = {ack: "", filing: "", intimation: ""};
+    const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+    // 1) Caption/value pairs.
+    for (const lab of document.querySelectorAll(".rightsideLabel")){
+      const key = clean(lab.textContent).replace(/:/g, "").toLowerCase();
+      let val = "";
+      let sib = lab.nextElementSibling;
+      while (sib){
+        if (sib.classList && sib.classList.contains("fieldVal")){ val = clean(sib.textContent); break; }
+        sib = sib.nextElementSibling;
       }
+      if (!val && lab.parentElement){
+        const fv = lab.parentElement.querySelector(".fieldVal");
+        if (fv) val = clean(fv.textContent);
+      }
+      if (!val) continue;
+      if (!out.ack && key.includes("acknowledgement")) out.ack = val;         // first wins
+      else if (!out.filing && (key.includes("filing date") || key.includes("date of filing"))) out.filing = val;
     }
-    if (!best) return false;
-    best.el.scrollIntoView({block:'center'});
-    best.el.click();
-    return true;
-    """
 
-    for _ in range(3):
-        _open_profile_menu(portal)
-        time.sleep(1.0)
+    // 2) Intimation Order date from the 'Download Intimation Order Dated ...' link.
+    for (const el of document.querySelectorAll(".hyperLink, span, a")){
+      const t = clean(el.textContent);
+      if (!t || t.length > 90) continue;
+      const m = t.match(/intimation order dated\s*(.+)/i);
+      if (m){ out.intimation = m[1].trim(); break; }
+    }
+    return out;
+    """
+    # Poll briefly, but return the instant any field is found (data usually
+    # appears immediately after the filter is applied).
+    data = {}
+    end = time.time() + 4
+    while time.time() < end:
         try:
-            if d.execute_script(click_logout_js):
-                portal.wait_loaded(timeout=15)
-                portal.log("  logged out")
-                return True
+            data = portal.driver.execute_script(js) or {}
+        except Exception:
+            data = {}
+        if data.get("ack") or data.get("filing") or data.get("intimation"):
+            break
+        time.sleep(0.2)
+
+    def val(x):
+        x = (str(x) if x is not None else "").strip()
+        return x if x else "Not found"
+
+    return {
+        "ack": val(data.get("ack")),
+        "filing_date": val(data.get("filing")),
+        "intimation": val(data.get("intimation")),
+    }
+
+
+def logout(portal):
+    """Open the profile menu (button.profileMenubtn), click 'Log Out', then
+    click 'Log In Again' so we land back on the login page WITHOUT reopening the
+    browser — ready for the next row."""
+    portal.wait_loaded(timeout=15)
+
+    done = False
+    for _ in range(3):
+        try:
+            portal.click_css("button.profileMenubtn", timeout=6)   # open profile menu
         except Exception:
             pass
         time.sleep(0.6)
-    portal.log("  (could not click Log Out — closing the browser ends the session)")
-    return False
+        try:
+            portal.click_menu_item("Log Out", timeout=5)           # dropdown item
+            done = True
+            break
+        except Exception:
+            time.sleep(0.5)
+    if not done:
+        portal.log("  WARNING: could not click Log Out")
 
-
-def _open_profile_menu(portal):
-    """Click the profile toggle (avatar / name / caret) in the top-right header
-    so the My Profile / Change Password / Log Out menu drops down."""
-    open_js = r"""
-    const W = window.innerWidth;
-    function clsOf(el){
-      const c = el.className;
-      if (c && typeof c === 'object' && 'baseVal' in c) return c.baseVal;   // SVG
-      return (c || '') + '';
-    }
-    let best = null;
-    for (const el of document.querySelectorAll('img,i,svg,span,div,a,button,li')){
-      const r = el.getBoundingClientRect();
-      if (r.width===0 || r.height===0) continue;
-      if (r.top > 110 || r.left < W*0.5) continue;          // top-right header band
-      const c = clsOf(el).toLowerCase();
-      const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-      let score = 0;
-      if (el.tagName === 'IMG') score += 3;                                       // avatar
-      if (/chevron|caret|angle|arrow|expand|dropdown|down/.test(c)) score += 4;   // caret icon
-      if (/individual|\bhuf\b|profile|account/.test(txt) && txt.length < 40) score += 2;
-      if (score === 0) continue;
-      const s = score - (r.width * r.height) / 200000;       // prefer small toggles/icons
-      if (!best || s > best.s){ best = {el: el, s: s}; }
-    }
-    if (!best){                                              // fallback: right-most clickable
-      for (const el of document.querySelectorAll('a,button,img,i,span,div')){
-        const r = el.getBoundingClientRect();
-        if (r.width===0 || r.height===0 || r.top > 110) continue;
-        if (!best || r.left > best.left){ best = {el: el, left: r.left}; }
-      }
-    }
-    if (!best) return false;
-    best.el.scrollIntoView({block:'center'});
-    best.el.click();
-    return true;
-    """
+    # After logout the portal shows a 'Log In Again' button (registerButton).
+    # click_css already polls for it, so no separate page-load wait is needed.
     try:
-        portal.driver.execute_script(open_js)
+        portal.click_css("button.registerButton", timeout=8)
     except Exception:
-        pass
+        try:
+            portal.click_text("Log In Again", timeout=4)
+        except Exception:
+            pass
+    time.sleep(1.0)   # ~1s break; the next login() waits for the PAN field itself
+    portal.log("  logged out")
+    return done
 
 
 # ---- small file/text utilities ------------------------------------------- #
@@ -808,7 +818,16 @@ def normalize_ay(ay):
 # =========================================================================== #
 #  PART 3 — EXCEL  (template export + read rows + export updated copy)         #
 # =========================================================================== #
-HEADERS = ["Name", "PAN", "Password", "AY", "Status"]
+HEADERS = ["Name", "PAN", "Password", "AY",
+           "Status", "Acknowledgement No", "Filing Date", "Intimation"]
+
+# Internal field key -> column header, for the values the tool fills in itself.
+OUTPUT_COLS = [
+    ("status", "Status"),
+    ("ack", "Acknowledgement No"),
+    ("filing_date", "Filing Date"),
+    ("intimation", "Intimation"),
+]
 
 
 def export_template(path):
@@ -830,13 +849,13 @@ def export_template(path):
         cell.border = border
 
     # A sample row (greyed) to show the expected format.
-    sample = ["John Doe", "ABCDE1234F", "YourPassword", "2026-27", ""]
+    sample = ["John Doe", "ABCDE1234F", "YourPassword", "2026-27", "", "", "", ""]
     for c, v in enumerate(sample, start=1):
         cell = ws.cell(row=2, column=c, value=v)
         cell.font = Font(italic=True, color="9C9C9C")
         cell.border = border
 
-    widths = [26, 16, 18, 12, 34]
+    widths = [24, 16, 18, 12, 28, 22, 16, 24]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
     ws.freeze_panes = "A2"
@@ -852,14 +871,19 @@ def export_template(path):
         "      PAN       - 10-character PAN, e.g. ABCDE1234F",
         "      Password  - the e-Filing portal login password for that PAN",
         "      AY        - Assessment Year to filter by, e.g. 2026-27",
-        "      Status    - LEAVE BLANK. The tool fills this automatically.",
+        "      Status              - LEAVE BLANK. Filled in automatically.",
+        "      Acknowledgement No  - LEAVE BLANK. Filled in automatically.",
+        "      Filing Date         - LEAVE BLANK. Filled in automatically.",
+        "      Intimation          - LEAVE BLANK. Filled in automatically.",
         "",
         "3. Delete the grey sample row before running.",
         "4. Save the file, then upload it in the tool and click Run.",
         "",
-        "The tool logs in for each row, reads the latest return status from the",
-        "Income-Tax portal, and fills it into the Status column. When the run",
-        "finishes, click 'Download Updated Excel' to save a copy with the results.",
+        "The tool logs in for each row, applies the Assessment Year filter, then",
+        "reads the latest status plus the Acknowledgement No, Filing Date and",
+        "Intimation Order date. Anything not present is recorded as 'Not found'.",
+        "When the run finishes, click 'Download Updated Excel' to save a copy",
+        "with all the results.",
     ]
     for r, line in enumerate(notes, start=1):
         cell = info.cell(row=r, column=1, value=line)
@@ -885,9 +909,13 @@ def read_rows(path):
     for needed in ("pan", "password", "ay"):
         if needed not in col_map:
             raise ValueError(f"Column '{needed.upper()}' not found in the sheet header.")
-    if "status" not in col_map:
-        col_map["status"] = ws.max_column + 1
-        ws.cell(row=1, column=col_map["status"], value="Status")
+    # Make sure every output column exists (append any that are missing, so old
+    # templates without the new columns still work).
+    for _key, header in OUTPUT_COLS:
+        lk = header.strip().lower()
+        if lk not in col_map:
+            col_map[lk] = ws.max_column + 1
+            ws.cell(row=1, column=col_map[lk], value=header)
 
     rows = []
     for r in range(2, ws.max_row + 1):
@@ -911,12 +939,18 @@ def read_rows(path):
 
 
 def save_updated_excel(src_path, results, dst_path):
-    """Load the uploaded workbook, write the collected statuses into the Status
-    column, and save a NEW copy to dst_path. The original file is left
-    untouched. `results` maps excel_row -> status."""
+    """Load the uploaded workbook, write the collected values (Status,
+    Acknowledgement No, Filing Date, Intimation) into their columns, and save a
+    NEW copy to dst_path. The original file is left untouched. `results` maps
+    excel_row -> dict of field values."""
     wb, ws, col_map, _ = read_rows(src_path)
-    for excel_row, status in results.items():
-        ws.cell(row=excel_row, column=col_map["status"], value=status)
+    for excel_row, data in results.items():
+        if not isinstance(data, dict):
+            data = {"status": data}                          # tolerate a bare status
+        for key, header in OUTPUT_COLS:
+            idx = col_map.get(header.strip().lower())
+            if idx:
+                ws.cell(row=excel_row, column=idx, value=data.get(key, "Not found"))
     wb.save(dst_path)
 
 
@@ -941,47 +975,84 @@ def run_batch(excel_path, headless, log, stop_event, on_result):
     log(f"Loaded {len(rows)} row(s).")
     log("=" * 60)
 
-    for i, row in enumerate(rows, start=1):
-        if stop_event.is_set():
-            log("Stopped by user.")
-            break
+    # One browser for the whole batch — we log out and click 'Log In Again'
+    # between rows instead of reopening Edge each time (much faster).
+    portal = None
+    try:
+        portal = IncomeTaxPortal(headless=headless, log=log)
 
-        name, pan, pw, ay = row["name"], row["pan"], row["password"], row["ay"]
-        log(f"[{i}/{len(rows)}] {name or pan}  (PAN {pan}, AY {ay or '—'})")
+        for i, row in enumerate(rows, start=1):
+            if stop_event.is_set():
+                log("Stopped by user.")
+                break
 
-        portal = None
-        status = "Error"
-        try:
-            portal = IncomeTaxPortal(headless=headless, log=log)
-            portal.login(pan, pw)
+            name, pan, pw, ay = row["name"], row["pan"], row["password"], row["ay"]
+            log(f"[{i}/{len(rows)}] {name or pan}  (PAN {pan}, AY {ay or '—'})")
 
-            go_to_filed_returns(portal)
-            if ay:
-                filter_by_ay(portal, ay)
+            data = {"status": "Error", "ack": "Not found",
+                    "filing_date": "Not found", "intimation": "Not found"}
+            try:
+                portal.login(pan, pw)
 
-            status = read_latest_status(portal)
-            log(f"  STATUS: {status}")
+                go_to_filed_returns(portal)
+                if ay:
+                    filter_by_ay(portal, ay)
 
-            logout(portal)
+                data["status"] = read_latest_status(portal)
+                log(f"  STATUS: {data['status']}")
 
-        except InvalidPasswordError:
-            status = "Invalid password"
-            log("  STATUS: Invalid password — skipping")
-        except LoginError as e:
-            status = "Login failed"
-            log(f"  STATUS: Login failed ({e})")
-        except Exception as e:
-            status = f"Error: {e}"
-            log(f"  ERROR: {e}")
-        finally:
-            on_result(row["excel_row"], status)
-            if portal:
-                portal.quit()
-            time.sleep(1.0)   # small gap before next login
-        log("-" * 60)
+                # Only pull the extra fields when a filing actually exists.
+                if data["status"] not in ("ITR not filed", "Status not found"):
+                    data.update(extract_fields(portal))
+                log(f"  Ack: {data['ack']}  |  Filed: {data['filing_date']}  |  "
+                    f"Intimation: {data['intimation']}")
+
+                logout(portal)          # ends on the login page ('Log In Again')
+
+            except InvalidPasswordError:
+                data["status"] = "Invalid password"
+                log("  STATUS: Invalid password — skipping")
+                _recover_to_login(portal)
+            except LoginError as e:
+                data["status"] = "Login failed"
+                log(f"  STATUS: Login failed ({e})")
+                _recover_to_login(portal)
+            except Exception as e:
+                data["status"] = f"Error: {e}"
+                log(f"  ERROR: {e}")
+                _recover_to_login(portal)
+            finally:
+                on_result(row["excel_row"], data)
+            log("-" * 60)
+    finally:
+        if portal:
+            portal.quit()
 
     log("=" * 60)
     log("Done. Click 'Download Updated Excel' to save your results.")
+
+
+def _recover_to_login(portal):
+    """After a failed row, return the SAME browser to a clean login page for the
+    next row. Try a normal logout first; if that doesn't land us on the login
+    page, clear the session and reload it (never reopens the browser)."""
+    try:
+        logout(portal)
+    except Exception:
+        pass
+    try:
+        if portal._on_login_page(timeout=3):
+            return
+    except Exception:
+        pass
+    try:
+        portal.driver.delete_all_cookies()
+    except Exception:
+        pass
+    try:
+        portal.driver.get(portal.LOGIN_URL)
+    except Exception:
+        pass
 
 
 # =========================================================================== #
@@ -1163,8 +1234,8 @@ class App:
         finally:
             self.log_queue.put("__DONE__")
 
-    def _store_result(self, excel_row, status):
-        self.results[excel_row] = status
+    def _store_result(self, excel_row, data):
+        self.results[excel_row] = data
 
     # ---- thread-safe logging --------------------------------------------- #
     def _log(self, msg):
