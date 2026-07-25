@@ -33,6 +33,7 @@ import threading
 import queue
 import re
 import json
+from datetime import date, datetime
 
 # --- GUI -------------------------------------------------------------------
 import tkinter as tk
@@ -803,6 +804,40 @@ def logout(portal):
 
 
 # ---- small file/text utilities ------------------------------------------- #
+_MONTHS = {m.lower(): i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
+
+
+def parse_portal_date(s):
+    """Parse a portal date like 'Jun 10, 2026' into a real datetime.date.
+    Month names are parsed manually (not via strptime) so it works regardless
+    of the machine's locale. Returns None if `s` is not a date (e.g. 'Not found')."""
+    s = str(s or "").strip()
+    if not s:
+        return None
+    m = re.match(r"([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})$", s)   # Jun 10, 2026
+    if m:
+        mon = _MONTHS.get(m.group(1)[:3].lower())
+        if mon:
+            try:
+                return date(int(m.group(3)), mon, int(m.group(2)))
+            except Exception:
+                return None
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%b-%Y", "%d %b %Y"):  # numeric fallbacks
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def fmt_date_display(s):
+    """Portal date -> 'DD-MM-YYYY' for the log; unchanged if not a date."""
+    d = parse_portal_date(s)
+    return d.strftime("%d-%m-%Y") if d else s
+
+
 def normalize_ay(ay):
     """'AY 2026-27' / '2026-27' / '2026-2027' -> '2026-27'."""
     s = str(ay).strip()
