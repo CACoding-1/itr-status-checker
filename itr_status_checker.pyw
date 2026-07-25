@@ -32,6 +32,7 @@ import time
 import threading
 import queue
 import re
+import json
 
 # --- GUI -------------------------------------------------------------------
 import tkinter as tk
@@ -816,10 +817,83 @@ def normalize_ay(ay):
 
 
 # =========================================================================== #
+#  VERIFIED (Yes/No) — with a small self-training knowledge base                #
+# =========================================================================== #
+# Default rule: a return is "verified" if its status shows it was processed or
+# e-verified, OR an intimation order exists. The tool also LEARNS: every new
+# status it meets is recorded (with its verdict) in a JSON file you can review
+# and correct, so future runs reuse your decisions.
+
+VERIFIED_KEYWORDS = ("processed", "e-verified", "everified", "verified")
+
+# Statuses that carry no verification info — always 'No', never learned.
+_NON_STATUS = ("invalid password", "login failed", "itr not filed",
+               "status not found", "error")
+
+
+def verified_rules_path():
+    d = os.path.join(os.path.expanduser("~"), ".itr_status_checker")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(d, "verified_rules.json")
+
+
+def load_verified_rules():
+    """Return {normalized status -> 'Yes'/'No'} learned so far (or {})."""
+    try:
+        with open(verified_rules_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {_norm_status(k): ("Yes" if str(v).strip().lower().startswith("y") else "No")
+                    for k, v in data.items() if str(k).strip()}
+    except Exception:
+        pass
+    return {}
+
+
+def save_verified_rules(rules):
+    try:
+        with open(verified_rules_path(), "w", encoding="utf-8") as f:
+            json.dump(rules, f, indent=2, ensure_ascii=False, sort_keys=True)
+        return True
+    except Exception:
+        return False
+
+
+def _norm_status(s):
+    return re.sub(r"\s+", " ", str(s or "").strip().lower())
+
+
+def classify_verified(status, intimation, rules=None):
+    """Return 'Yes'/'No'. An intimation order always means verified; otherwise
+    consult the learned rules, then the default keyword heuristic."""
+    rules = rules or {}
+    s = _norm_status(status)
+    intim = _norm_status(intimation)
+    if intim and intim != "not found":
+        return "Yes"
+    if not s or any(s.startswith(k) for k in _NON_STATUS):
+        return "No"
+    if s in rules:                       # user/learned decision wins
+        return rules[s]
+    if any(k in s for k in VERIFIED_KEYWORDS):
+        return "Yes"
+    return "No"
+
+
+def learnable_status(status):
+    """True if this status is a real portal status worth remembering."""
+    s = _norm_status(status)
+    return bool(s) and not any(s.startswith(k) for k in _NON_STATUS)
+
+
+# =========================================================================== #
 #  PART 3 — EXCEL  (template export + read rows + export updated copy)         #
 # =========================================================================== #
-HEADERS = ["Name", "PAN", "Password", "AY",
-           "Status", "Acknowledgement No", "Filing Date", "Intimation"]
+HEADERS = ["Name", "PAN", "Password", "AY", "Status",
+           "Acknowledgement No", "Filing Date", "Intimation", "Verified"]
 
 # Internal field key -> column header, for the values the tool fills in itself.
 OUTPUT_COLS = [
@@ -827,6 +901,7 @@ OUTPUT_COLS = [
     ("ack", "Acknowledgement No"),
     ("filing_date", "Filing Date"),
     ("intimation", "Intimation"),
+    ("verified", "Verified"),
 ]
 
 
@@ -849,13 +924,13 @@ def export_template(path):
         cell.border = border
 
     # A sample row (greyed) to show the expected format.
-    sample = ["John Doe", "ABCDE1234F", "YourPassword", "2026-27", "", "", "", ""]
+    sample = ["John Doe", "ABCDE1234F", "YourPassword", "2026-27", "", "", "", "", ""]
     for c, v in enumerate(sample, start=1):
         cell = ws.cell(row=2, column=c, value=v)
         cell.font = Font(italic=True, color="9C9C9C")
         cell.border = border
 
-    widths = [24, 16, 18, 12, 28, 22, 16, 24]
+    widths = [24, 16, 18, 12, 28, 22, 16, 24, 10]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
     ws.freeze_panes = "A2"
@@ -875,6 +950,7 @@ def export_template(path):
         "      Acknowledgement No  - LEAVE BLANK. Filled in automatically.",
         "      Filing Date         - LEAVE BLANK. Filled in automatically.",
         "      Intimation          - LEAVE BLANK. Filled in automatically.",
+        "      Verified            - LEAVE BLANK. Yes/No, filled automatically.",
         "",
         "3. Delete the grey sample row before running.",
         "4. Save the file, then upload it in the tool and click Run.",
@@ -882,8 +958,11 @@ def export_template(path):
         "The tool logs in for each row, applies the Assessment Year filter, then",
         "reads the latest status plus the Acknowledgement No, Filing Date and",
         "Intimation Order date. Anything not present is recorded as 'Not found'.",
-        "When the run finishes, click 'Download Updated Excel' to save a copy",
-        "with all the results.",
+        "It also marks Verified = Yes/No (Yes when the return is processed or",
+        "e-verified, or an intimation exists).",
+        "",
+        "When the run finishes, THIS SAME FILE is updated in place with the",
+        "results — no separate download needed. (Keep it closed while running.)",
     ]
     for r, line in enumerate(notes, start=1):
         cell = info.cell(row=r, column=1, value=line)
@@ -975,6 +1054,11 @@ def run_batch(excel_path, headless, log, stop_event, on_result):
     log(f"Loaded {len(rows)} row(s).")
     log("=" * 60)
 
+    rules = load_verified_rules()        # learned Yes/No decisions so far
+    rules_changed = False
+    collected = {}                       # excel_row -> data (for writing back)
+    lock_warned = [False]                # so we warn about a locked file only once
+
     # One browser for the whole batch — we log out and click 'Log In Again'
     # between rows instead of reopening Edge each time (much faster).
     portal = None
@@ -989,8 +1073,8 @@ def run_batch(excel_path, headless, log, stop_event, on_result):
             name, pan, pw, ay = row["name"], row["pan"], row["password"], row["ay"]
             log(f"[{i}/{len(rows)}] {name or pan}  (PAN {pan}, AY {ay or '—'})")
 
-            data = {"status": "Error", "ack": "Not found",
-                    "filing_date": "Not found", "intimation": "Not found"}
+            data = {"status": "Error", "ack": "Not found", "filing_date": "Not found",
+                    "intimation": "Not found", "verified": "No"}
             try:
                 portal.login(pan, pw)
 
@@ -1022,14 +1106,54 @@ def run_batch(excel_path, headless, log, stop_event, on_result):
                 log(f"  ERROR: {e}")
                 _recover_to_login(portal)
             finally:
+                # Verified Yes/No + self-training on any newly-seen status.
+                data["verified"] = classify_verified(data["status"], data["intimation"], rules)
+                if learnable_status(data["status"]) and _norm_status(data["status"]) not in rules:
+                    rules[_norm_status(data["status"])] = data["verified"]
+                    rules_changed = True
+                log(f"  Verified: {data['verified']}")
+
+                collected[row["excel_row"]] = data
                 on_result(row["excel_row"], data)
+                _write_back(excel_path, collected, log, lock_warned)   # update template as we go
             log("-" * 60)
     finally:
         if portal:
             portal.quit()
 
+    if rules_changed:
+        save_verified_rules(rules)
+
+    # Final write-back into the uploaded template (report the outcome clearly).
+    if collected:
+        if _write_back(excel_path, collected, log, [False], final=True):
+            log(f"Your template was updated in place:\n  {excel_path}")
+        else:
+            log("Could NOT update your template (it may be open in Excel). "
+                "Close it, then click 'Save to my template'.")
+
     log("=" * 60)
-    log("Done. Click 'Download Updated Excel' to save your results.")
+    log("Done.")
+
+
+def _write_back(excel_path, collected, log, lock_warned, final=False):
+    """Write the collected results straight back into the uploaded template.
+    Returns True on success. On a locked file (open in Excel) it warns once
+    (unless final) and returns False — the run keeps going regardless."""
+    try:
+        save_updated_excel(excel_path, collected, excel_path)
+        return True
+    except PermissionError:
+        if final or not lock_warned[0]:
+            log("  NOTE: template is open in Excel — results kept in memory; "
+                "close it to let the tool save.")
+            lock_warned[0] = True
+        return False
+    except Exception as e:
+        if final or not lock_warned[0]:
+            log(f"  NOTE: couldn't update the template ({e}).")
+            lock_warned[0] = True
+        return False
 
 
 def _recover_to_login(portal):
@@ -1088,7 +1212,7 @@ class App:
                          font=("Segoe UI", 12, "bold"))
         head.pack(anchor="w", padx=12, pady=(12, 2))
         ttk.Label(self.root,
-                  text="Flow:  download template  ›  fill it  ›  upload  ›  Run  ›  download updated Excel",
+                  text="Flow:  download template  ›  fill it  ›  upload  ›  Run  (your file is updated in place)",
                   foreground="#555").pack(anchor="w", padx=12, pady=(0, 8))
 
         # Step 1 — template
@@ -1096,7 +1220,7 @@ class App:
         f1.pack(fill="x", **pad)
         ttk.Button(f1, text="Download Excel Template…",
                    command=self.on_template).pack(side="left", padx=8, pady=8)
-        ttk.Label(f1, text="Columns: Name · PAN · Password · AY · Status (auto-filled)",
+        ttk.Label(f1, text="Columns you fill: Name · PAN · Password · AY   (Status … Verified are auto-filled)",
                   foreground="#555").pack(side="left", padx=6)
 
         # Step 2 — upload
@@ -1115,13 +1239,16 @@ class App:
         ttk.Checkbutton(f4, text="Headless (hide browser — not recommended; OTP/CAPTCHA need the window)",
                         variable=self.headless).pack(side="left", padx=12)
 
-        # Step 4 — download updated Excel
-        f5 = ttk.LabelFrame(self.root, text="Step 4 — Get your results")
+        # Step 4 — results (written back into your uploaded file) + training
+        f5 = ttk.LabelFrame(self.root, text="Step 4 — Results & training")
         f5.pack(fill="x", **pad)
-        self.download_btn = ttk.Button(f5, text="Download Updated Excel…",
-                                       command=self.on_download_excel, state="disabled")
-        self.download_btn.pack(side="left", padx=8, pady=8)
-        ttk.Label(f5, text="Saves a NEW copy with the Status column filled in (original untouched).",
+        self.save_btn = ttk.Button(f5, text="Save to my template",
+                                   command=self.on_save_to_template, state="disabled")
+        self.save_btn.pack(side="left", padx=8, pady=8)
+        ttk.Button(f5, text="Verified rules (train)…",
+                   command=self.on_train_verified).pack(side="left", padx=4, pady=8)
+        ttk.Label(f5, text="Results are written straight into your uploaded file. "
+                           "'Save' re-writes it if it was open in Excel.",
                   foreground="#555").pack(side="left", padx=6)
 
         # Log
@@ -1169,24 +1296,110 @@ class App:
             except Exception as e:
                 self._log(f"  WARNING: {e}")
 
-    def on_download_excel(self):
+    def on_save_to_template(self):
+        """Write the collected results back into the uploaded file (in place).
+        Used as a retry if the file was open in Excel during the run."""
         if not self.results:
             messagebox.showinfo("Nothing yet",
-                                "Run the batch first — there are no statuses to save.")
+                                "Run the batch first — there are no results to save.")
             return
-        path = filedialog.asksaveasfilename(
-            title="Save updated Excel as…",
-            defaultextension=".xlsx",
-            initialfile="ITR_status_updated.xlsx",
-            filetypes=[("Excel workbook", "*.xlsx")])
-        if not path:
-            return
+        path = self.excel_path.get()
         try:
-            save_updated_excel(self.excel_path.get(), dict(self.results), path)
-            self._log(f"Updated Excel saved: {path}")
-            messagebox.showinfo("Saved", f"Updated Excel saved:\n{path}")
+            save_updated_excel(path, dict(self.results), path)
+            self._log(f"Saved results into your template: {path}")
+            messagebox.showinfo("Saved", f"Your template was updated:\n{path}")
+        except PermissionError:
+            messagebox.showerror(
+                "File is open",
+                "Your template is open in Excel. Close it and try again.")
         except Exception as e:
             messagebox.showerror("Could not save", str(e))
+
+    def on_train_verified(self):
+        """Open a small dialog to review and edit the learned Verified (Yes/No)
+        rules — the tool's self-training knowledge base."""
+        rules = load_verified_rules()
+
+        win = tk.Toplevel(self.root)
+        win.title("Verified rules — train Yes/No")
+        win.geometry("560x460")
+        win.transient(self.root)
+
+        ttk.Label(win, text="Teach the tool which statuses count as Verified. "
+                            "Intimations always count as Yes.",
+                  wraplength=520, foreground="#333").pack(anchor="w", padx=12, pady=(12, 4))
+
+        listwrap = ttk.Frame(win)
+        listwrap.pack(fill="both", expand=True, padx=12, pady=4)
+        lb = tk.Listbox(listwrap, font=("Consolas", 10), activestyle="dotbox")
+        sb = ttk.Scrollbar(listwrap, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+        order = []            # parallel list of status keys, matching listbox rows
+
+        def refresh(select=None):
+            lb.delete(0, "end")
+            order.clear()
+            for k in sorted(rules):
+                order.append(k)
+                lb.insert("end", f"{rules[k]:>3}   |   {k}")
+            if select in order:
+                idx = order.index(select)
+                lb.selection_set(idx)
+                lb.see(idx)
+
+        # editor row
+        editor = ttk.Frame(win)
+        editor.pack(fill="x", padx=12, pady=(4, 2))
+        ttk.Label(editor, text="Status:").pack(side="left")
+        status_var = tk.StringVar()
+        ttk.Entry(editor, textvariable=status_var, width=40).pack(side="left", padx=6)
+        verdict_var = tk.StringVar(value="Yes")
+        ttk.Radiobutton(editor, text="Yes", variable=verdict_var, value="Yes").pack(side="left")
+        ttk.Radiobutton(editor, text="No", variable=verdict_var, value="No").pack(side="left")
+
+        def on_select(_evt=None):
+            sel = lb.curselection()
+            if sel:
+                k = order[sel[0]]
+                status_var.set(k)
+                verdict_var.set(rules.get(k, "Yes"))
+        lb.bind("<<ListboxSelect>>", on_select)
+
+        def add_update():
+            k = _norm_status(status_var.get())
+            if not k:
+                return
+            rules[k] = verdict_var.get()
+            refresh(select=k)
+
+        def remove():
+            k = _norm_status(status_var.get())
+            if k in rules:
+                del rules[k]
+                status_var.set("")
+                refresh()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=(2, 6))
+        ttk.Button(btns, text="Add / Update", command=add_update).pack(side="left")
+        ttk.Button(btns, text="Remove", command=remove).pack(side="left", padx=6)
+
+        def save_close():
+            if save_verified_rules(rules):
+                self._log(f"Saved {len(rules)} verified rule(s).")
+            else:
+                messagebox.showerror("Could not save", "Failed to save the rules file.")
+            win.destroy()
+
+        foot = ttk.Frame(win)
+        foot.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(foot, text="Save & Close", command=save_close).pack(side="right")
+        ttk.Button(foot, text="Cancel", command=win.destroy).pack(side="right", padx=6)
+
+        refresh()
 
     def on_run(self):
         if self.worker and self.worker.is_alive():
@@ -1201,7 +1414,9 @@ class App:
         if not messagebox.askyesno(
                 "Start batch?",
                 "An Edge window will open and log in for each row in turn.\n\n"
-                "Keep the browser visible so you can solve any OTP/CAPTCHA.\n\n"
+                "Keep the browser visible so you can solve any OTP/CAPTCHA.\n"
+                "Your results are written back into this same file — please keep "
+                "it CLOSED in Excel while the run is in progress.\n\n"
                 "Start now?"):
             return
 
@@ -1209,7 +1424,7 @@ class App:
         self.stop_event.clear()
         self.run_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.download_btn.configure(state="disabled")
+        self.save_btn.configure(state="disabled")
         self._log("\n>>> Starting batch…\n")
 
         self.worker = threading.Thread(
@@ -1252,7 +1467,7 @@ class App:
                     self.run_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
                     if self.results:
-                        self.download_btn.configure(state="normal")
+                        self.save_btn.configure(state="normal")
                 else:
                     self._log(msg)
         except queue.Empty:
