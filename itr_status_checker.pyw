@@ -1052,19 +1052,33 @@ def read_rows(path):
     return wb, ws, col_map, rows
 
 
+# Field keys that hold dates — written as real dates so Excel recognises them.
+DATE_KEYS = ("filing_date", "intimation")
+
+
 def save_updated_excel(src_path, results, dst_path):
-    """Load the uploaded workbook, write the collected values (Status,
-    Acknowledgement No, Filing Date, Intimation) into their columns, and save a
-    NEW copy to dst_path. The original file is left untouched. `results` maps
-    excel_row -> dict of field values."""
+    """Write the collected values (Status, Acknowledgement No, Filing Date,
+    Intimation, Verified) into their columns and save to dst_path. Date fields
+    are written as REAL dates with a DD-MM-YYYY number format so Excel treats
+    them as dates. `results` maps excel_row -> dict of field values."""
     wb, ws, col_map, _ = read_rows(src_path)
     for excel_row, data in results.items():
         if not isinstance(data, dict):
             data = {"status": data}                          # tolerate a bare status
         for key, header in OUTPUT_COLS:
             idx = col_map.get(header.strip().lower())
-            if idx:
-                ws.cell(row=excel_row, column=idx, value=data.get(key, "Not found"))
+            if not idx:
+                continue
+            raw = data.get(key, "Not found")
+            cell = ws.cell(row=excel_row, column=idx)
+            if key in DATE_KEYS:
+                d = parse_portal_date(raw)
+                if d is not None:
+                    cell.value = d
+                    cell.number_format = "DD-MM-YYYY"        # real date; Excel identifies it
+                    continue
+                cell.number_format = "General"               # e.g. 'Not found'
+            cell.value = raw
     wb.save(dst_path)
 
 
@@ -1123,8 +1137,8 @@ def run_batch(excel_path, headless, log, stop_event, on_result):
                 # Only pull the extra fields when a filing actually exists.
                 if data["status"] not in ("ITR not filed", "Status not found"):
                     data.update(extract_fields(portal))
-                log(f"  Ack: {data['ack']}  |  Filed: {data['filing_date']}  |  "
-                    f"Intimation: {data['intimation']}")
+                log(f"  Ack: {data['ack']}  |  Filed: {fmt_date_display(data['filing_date'])}"
+                    f"  |  Intimation: {fmt_date_display(data['intimation'])}")
 
                 logout(portal)          # ends on the login page ('Log In Again')
 
