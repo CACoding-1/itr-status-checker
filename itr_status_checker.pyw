@@ -28,6 +28,7 @@ RUN:
 """
 
 import os
+import sys
 import time
 import threading
 import queue
@@ -1085,6 +1086,56 @@ def save_updated_excel(src_path, results, dst_path):
 # =========================================================================== #
 #  PART 4 — THE BATCH WORKER (runs on a background thread)                      #
 # =========================================================================== #
+def process_one(portal, pan, pw, ay, log, rules):
+    """Run ONE return end-to-end in the given browser and return a data dict:
+    {status, ack, filing_date, intimation, verified}. Handles its own errors,
+    and on failure returns the browser to a clean login page for the next row."""
+    data = {"status": "Error", "ack": "Not found", "filing_date": "Not found",
+            "intimation": "Not found", "verified": "No"}
+    try:
+        portal.login(pan, pw)
+
+        go_to_filed_returns(portal)
+        if ay:
+            filter_by_ay(portal, ay)
+
+        data["status"] = read_latest_status(portal)
+        log(f"  STATUS: {data['status']}")
+
+        # Only pull the extra fields when a filing actually exists.
+        if data["status"] not in ("ITR not filed", "Status not found"):
+            data.update(extract_fields(portal))
+        log(f"  Ack: {data['ack']}  |  Filed: {fmt_date_display(data['filing_date'])}"
+            f"  |  Intimation: {fmt_date_display(data['intimation'])}")
+
+        logout(portal)                  # ends on the login page ('Log In Again')
+
+    except InvalidPasswordError:
+        data["status"] = "Invalid password"
+        log("  STATUS: Invalid password — skipping")
+        _recover_to_login(portal)
+    except LoginError as e:
+        data["status"] = "Login failed"
+        log(f"  STATUS: Login failed ({e})")
+        _recover_to_login(portal)
+    except Exception as e:
+        data["status"] = f"Error: {e}"
+        log(f"  ERROR: {e}")
+        _recover_to_login(portal)
+
+    data["verified"] = classify_verified(data["status"], data["intimation"], rules)
+    return data
+
+
+def _learn_status(rules, data):
+    """Record a newly-seen real status in the rules map. Returns True if added."""
+    s = _norm_status(data["status"])
+    if learnable_status(data["status"]) and s not in rules:
+        rules[s] = data["verified"]
+        return True
+    return False
+
+
 def run_batch(excel_path, headless, log, stop_event, on_result):
     if not _OPENPYXL_OK:
         log("ERROR: openpyxl is not installed. Run:  pip install openpyxl")
@@ -1122,49 +1173,14 @@ def run_batch(excel_path, headless, log, stop_event, on_result):
             name, pan, pw, ay = row["name"], row["pan"], row["password"], row["ay"]
             log(f"[{i}/{len(rows)}] {name or pan}  (PAN {pan}, AY {ay or '—'})")
 
-            data = {"status": "Error", "ack": "Not found", "filing_date": "Not found",
-                    "intimation": "Not found", "verified": "No"}
-            try:
-                portal.login(pan, pw)
+            data = process_one(portal, pan, pw, ay, log, rules)
+            if _learn_status(rules, data):
+                rules_changed = True
+            log(f"  Verified: {data['verified']}")
 
-                go_to_filed_returns(portal)
-                if ay:
-                    filter_by_ay(portal, ay)
-
-                data["status"] = read_latest_status(portal)
-                log(f"  STATUS: {data['status']}")
-
-                # Only pull the extra fields when a filing actually exists.
-                if data["status"] not in ("ITR not filed", "Status not found"):
-                    data.update(extract_fields(portal))
-                log(f"  Ack: {data['ack']}  |  Filed: {fmt_date_display(data['filing_date'])}"
-                    f"  |  Intimation: {fmt_date_display(data['intimation'])}")
-
-                logout(portal)          # ends on the login page ('Log In Again')
-
-            except InvalidPasswordError:
-                data["status"] = "Invalid password"
-                log("  STATUS: Invalid password — skipping")
-                _recover_to_login(portal)
-            except LoginError as e:
-                data["status"] = "Login failed"
-                log(f"  STATUS: Login failed ({e})")
-                _recover_to_login(portal)
-            except Exception as e:
-                data["status"] = f"Error: {e}"
-                log(f"  ERROR: {e}")
-                _recover_to_login(portal)
-            finally:
-                # Verified Yes/No + self-training on any newly-seen status.
-                data["verified"] = classify_verified(data["status"], data["intimation"], rules)
-                if learnable_status(data["status"]) and _norm_status(data["status"]) not in rules:
-                    rules[_norm_status(data["status"])] = data["verified"]
-                    rules_changed = True
-                log(f"  Verified: {data['verified']}")
-
-                collected[row["excel_row"]] = data
-                on_result(row["excel_row"], data)
-                _write_back(excel_path, collected, log, lock_warned)   # update template as we go
+            collected[row["excel_row"]] = data
+            on_result(row["excel_row"], data)
+            _write_back(excel_path, collected, log, lock_warned)       # update template as we go
             log("-" * 60)
     finally:
         if portal:
@@ -1226,6 +1242,120 @@ def _recover_to_login(portal):
         portal.driver.get(portal.LOGIN_URL)
     except Exception:
         pass
+
+
+# =========================================================================== #
+#  PART 4b — EXCEL-DRIVEN JOB RUNNER (called by the Excel macro, headless CLI)  #
+# =========================================================================== #
+# The Excel macro exports the rows to a small JSON "job" file and runs:
+#     python itr_status_checker.pyw --job <job.json>
+# We do the browser work and write results to a TAB-separated file the macro
+# reads back. We NEVER open the workbook here — the macro owns Excel I/O, so the
+# file is never locked and the .xlsm macros are never stripped.
+def run_job(job_path):
+    """Process the rows listed in a job file and write results as TSV
+    (row <tab> status <tab> ack <tab> filing_date <tab> intimation <tab> verified).
+    Dates are emitted as YYYY-MM-DD so the macro can write them as real dates."""
+    try:
+        # utf-8-sig tolerates the BOM the Excel macro's UTF-8 writer adds.
+        with open(job_path, "r", encoding="utf-8-sig") as f:
+            job = json.load(f)
+    except Exception as e:
+        print(f"Could not read job file: {e}")
+        return
+
+    job_rows = job.get("rows", [])
+    headless = bool(job.get("headless", False))
+    results_path = job.get("results") or (job_path + ".results.tsv")
+    log_path = job.get("log")
+
+    logf = None
+    if log_path:
+        try:
+            logf = open(log_path, "a", encoding="utf-8")
+        except Exception:
+            logf = None
+
+    def log(m):
+        line = str(m)
+        if logf:
+            try:
+                logf.write(line + "\n")
+                logf.flush()
+            except Exception:
+                pass
+        try:
+            print(line)
+        except Exception:
+            pass
+
+    def to_iso(v):
+        """Dates -> 'YYYY-MM-DD' (unambiguous for the macro); else unchanged."""
+        d = parse_portal_date(v)
+        return d.strftime("%Y-%m-%d") if d else v
+
+    def clean(v):
+        return str(v).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+    results = {}
+
+    def flush():
+        lines = []
+        for k, v in results.items():
+            lines.append("\t".join(clean(x) for x in (
+                k, v["status"], v["ack"], v["filing_date"], v["intimation"], v["verified"])))
+        try:
+            with open(results_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except Exception as e:
+            log(f"  NOTE: could not write results ({e})")
+
+    log("=" * 60)
+    log(f"Job: {len(job_rows)} row(s), headless={headless}")
+
+    rules = load_verified_rules()
+    rules_changed = False
+    portal = None
+    try:
+        portal = IncomeTaxPortal(headless=headless, log=log)
+        for i, row in enumerate(job_rows, start=1):
+            r = row.get("row")
+            pan = str(row.get("pan", "")).strip()
+            pw = str(row.get("password", ""))
+            ay = str(row.get("ay", "")).strip()
+            if not pan or not pw:
+                continue
+            log(f"[{i}/{len(job_rows)}] PAN {pan}  (AY {ay or '—'})")
+
+            data = process_one(portal, pan, pw, ay, log, rules)
+            if _learn_status(rules, data):
+                rules_changed = True
+            log(f"  Verified: {data['verified']}")
+
+            results[str(r)] = {
+                "status": data["status"],
+                "ack": data["ack"],
+                "filing_date": to_iso(data["filing_date"]),
+                "intimation": to_iso(data["intimation"]),
+                "verified": data["verified"],
+            }
+            flush()                     # incremental — safe if it crashes mid-run
+            log("-" * 60)
+    except Exception as e:
+        log(f"FATAL: {e}")
+    finally:
+        if portal:
+            portal.quit()
+
+    if rules_changed:
+        save_verified_rules(rules)
+    flush()
+    log(f"Done. Results written to: {results_path}")
+    if logf:
+        try:
+            logf.close()
+        except Exception:
+            pass
 
 
 # =========================================================================== #
@@ -1535,4 +1665,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Excel macro path:  python itr_status_checker.pyw --job <job.json>
+    # (runs headless CLI, no GUI). Otherwise, launch the desktop app.
+    if "--job" in sys.argv:
+        i = sys.argv.index("--job")
+        run_job(sys.argv[i + 1] if i + 1 < len(sys.argv) else "")
+    else:
+        main()
