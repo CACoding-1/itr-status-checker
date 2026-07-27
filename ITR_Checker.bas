@@ -105,14 +105,36 @@ Public Sub ITR_Run()
     End If
 
     Dim pyExe As String, pyw As String, dataSheetName As String
-    pyExe = GetCfg(cfg, C_PYEXE)
+    pyExe = StripQuotes(GetCfg(cfg, C_PYEXE))
     If pyExe = "" Then pyExe = "python"
-    pyw = GetCfg(cfg, C_PYW)
+    pyw = StripQuotes(GetCfg(cfg, C_PYW))
     dataSheetName = GetCfg(cfg, C_DATASHEET)
 
-    If pyw = "" Or Dir(pyw) = "" Then
-        MsgBox "Set a valid path to itr_status_checker.pyw in cell " & C_PYW & _
-               " of the " & CFG_SHEET & " sheet.", vbExclamation, "ITR Checker"
+    Dim pywOk As Boolean
+    On Error Resume Next
+    pywOk = (pyw <> "" And Dir(pyw) <> "")
+    On Error GoTo 0
+    If Not pywOk Then
+        MsgBox "Could not find itr_status_checker.pyw at this path:" & vbCrLf & vbCrLf & _
+               "    " & pyw & vbCrLf & vbCrLf & _
+               "Fix cell " & C_PYW & " on the " & CFG_SHEET & " sheet." & vbCrLf & vbCrLf & _
+               "Tip: in File Explorer hold SHIFT, right-click the file, choose " & _
+               "'Copy as path', paste it in, and REMOVE the surrounding quotes." & vbCrLf & _
+               "Note: your Downloads may live under OneDrive (…\OneDrive\Downloads\…).", _
+               vbExclamation, "ITR Checker"
+        Exit Sub
+    End If
+
+    ' Guard: make sure this .pyw is the version that supports the Excel button.
+    Dim pywText As String
+    On Error Resume Next
+    pywText = ReadUtf8(pyw)
+    On Error GoTo 0
+    If InStr(1, pywText, "def run_job", vbTextCompare) = 0 Then
+        MsgBox "This itr_status_checker.pyw is an OLDER version that does not " & _
+               "support the Excel button (it just opens the app window instead)." & vbCrLf & vbCrLf & _
+               "Replace it with the LATEST itr_status_checker.pyw, update cell " & C_PYW & _
+               " to point at it, and try again.", vbExclamation, "ITR Checker"
         Exit Sub
     End If
 
@@ -176,10 +198,11 @@ Public Sub ITR_Run()
         Exit Sub
     End If
 
-    ' Temp file locations (workbook folder, or TEMP if unsaved).
+    ' Temp files go in a LOCAL temp folder. Do NOT use the workbook folder: if
+    ' the workbook lives in OneDrive/SharePoint, its path is an https URL that
+    ' cannot hold these files and would silently break the whole run.
     Dim base As String
-    base = ThisWorkbook.Path
-    If base = "" Then base = Environ$("TEMP")
+    base = TempBase()
     Dim jobPath As String, resPath As String, logPath As String
     jobPath = base & Application.PathSeparator & "itr_job.json"
     resPath = base & Application.PathSeparator & "itr_results.tsv"
@@ -196,7 +219,17 @@ Public Sub ITR_Run()
     If Dir(resPath) <> "" Then Kill resPath
     On Error GoTo 0
 
+    ' Write the job file (fail loudly if the temp folder isn't writable).
+    On Error Resume Next
+    Err.Clear
     WriteUtf8 jobPath, jobJson
+    If Err.Number <> 0 Or Dir(jobPath) = "" Then
+        On Error GoTo 0
+        MsgBox "Could not create the temporary job file:" & vbCrLf & "    " & jobPath & vbCrLf & vbCrLf & _
+               "The Windows TEMP folder may not be writable.", vbCritical, "ITR Checker"
+        Exit Sub
+    End If
+    On Error GoTo 0
 
     If MsgBox(cnt & " row(s) will be processed." & vbCrLf & vbCrLf & _
               "An Edge window and a Python window will open. Keep them visible so " & _
@@ -218,16 +251,34 @@ Public Sub ITR_Run()
     ' Read results back into the sheet.
     Dim updated As Long
     updated = ITR_ImportResults(True)
-
-    ' Cleanup (keep the log for troubleshooting).
-    On Error Resume Next
-    If Dir(jobPath) <> "" Then Kill jobPath
-    If Dir(resPath) <> "" Then Kill resPath
-    On Error GoTo 0
-
     Application.StatusBar = False
-    MsgBox "Done. " & updated & " row(s) updated." & vbCrLf & _
-           "Log: " & logPath, vbInformation, "ITR Checker"
+
+    If updated > 0 Then
+        ' Success — clean up temp files (keep the log for reference).
+        On Error Resume Next
+        If Dir(jobPath) <> "" Then Kill jobPath
+        If Dir(resPath) <> "" Then Kill resPath
+        On Error GoTo 0
+        MsgBox "Done. " & updated & " row(s) updated." & vbCrLf & _
+               "Log: " & logPath, vbInformation, "ITR Checker"
+    Else
+        ' Nothing written — keep the temp files and explain what to check.
+        Dim diag As String
+        diag = "No cells were updated (0 rows)." & vbCrLf & vbCrLf
+        If Dir(resPath) = "" Then
+            diag = diag & "The engine produced NO results file, so it did not finish " & _
+                   "even one login. Open the log to see what happened."
+        Else
+            diag = diag & "Results were produced but not written to the sheet. Check that " & _
+                   "the OUTPUT column letters (Status / Ack / Filing / Intimation / Verified) " & _
+                   "are filled in on the " & CFG_SHEET & " sheet, and the Data sheet name is correct."
+        End If
+        diag = diag & vbCrLf & vbCrLf & _
+               "Log:     " & logPath & vbCrLf & _
+               "Results: " & resPath & vbCrLf & _
+               "Python exit code: " & rc
+        MsgBox diag, vbExclamation, "ITR Checker"
+    End If
     Exit Sub
 
 RunErr:
@@ -256,8 +307,7 @@ Public Function ITR_ImportResults(Optional ByVal silent As Boolean = False) As L
     If ds Is Nothing Then Exit Function
 
     Dim base As String
-    base = ThisWorkbook.Path
-    If base = "" Then base = Environ$("TEMP")
+    base = TempBase()
     Dim resPath As String
     resPath = base & Application.PathSeparator & "itr_results.tsv"
     If Dir(resPath) = "" Then
@@ -312,6 +362,27 @@ End Function
 
 Private Function GetCfg(ws As Worksheet, addr As String) As String
     GetCfg = Trim(CStr(ws.Range(addr).Value))
+End Function
+
+Private Function StripQuotes(ByVal s As String) As String
+    ' Remove wrapping double-quotes (e.g. from Explorer's 'Copy as path').
+    s = Trim(s)
+    If Len(s) >= 2 Then
+        If Left$(s, 1) = """" And Right$(s, 1) = """" Then
+            s = Mid$(s, 2, Len(s) - 2)
+        End If
+    End If
+    StripQuotes = Trim(s)
+End Function
+
+Private Function TempBase() As String
+    ' A LOCAL, writable temp folder for the job/results/log files. Never the
+    ' workbook folder (that can be a OneDrive https URL).
+    Dim t As String
+    t = Environ$("TEMP")
+    If t = "" Then t = Environ$("TMP")
+    If t = "" Then t = ThisWorkbook.Path
+    TempBase = t
 End Function
 
 Private Sub WriteRow(ws As Worksheet, labelCell As String, label As String, valCell As String, dflt As String)
